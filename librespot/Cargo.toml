@@ -1,0 +1,12 @@
+# Workspace trimmed to what the iPad daemon needs (librespot 0.6.0 core crates + iosglue).
+[workspace]
+resolver = "2"
+members = ["audio", "core", "metadata", "playback", "protocol", "iosglue"]
+
+[workspace.package]
+rust-version = "1.74"
+
+# Pure-Rust TLS: rustls/tokio-rustls without ring/aws-lc (see docs/CONHECIMENTO.md).
+[patch.crates-io]
+rustls = { path = "../vendor/rustls" }
+tokio-rustls = { path = "../vendor/tokio-rustls" }

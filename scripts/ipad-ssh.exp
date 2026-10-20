@@ -1,0 +1,15 @@
+#!/usr/bin/expect -f
+# Run a command on the iPad over SSH (password auth, legacy ssh-rsa).
+# Env: IPAD_PASS (required), IPAD_HOST (required, iPad IP), IPAD_JUMP (optional ProxyJump, e.g. root@some-host)
+set timeout 300
+set cmd [lindex $argv 0]
+if {![info exists env(IPAD_PASS)]} { puts "IPAD_PASS not set"; exit 2 }
+if {![info exists env(IPAD_HOST)]} { puts "IPAD_HOST not set"; exit 2 }
+set host $env(IPAD_HOST)
+set opts [list -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1 -o PreferredAuthentications=password -o PubkeyAuthentication=no]
+if {[info exists env(IPAD_JUMP)] && $env(IPAD_JUMP) ne ""} { lappend opts -J $env(IPAD_JUMP) }
+spawn ssh {*}$opts root@$host $cmd
+expect {
+  -re "(?i)password:" { send "$env(IPAD_PASS)\r"; exp_continue }
+  eof
+}

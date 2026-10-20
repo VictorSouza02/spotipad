@@ -1,0 +1,8 @@
+target/
+native/*.o
+native/spotipad
+credentials*.json
+cache/
+*.log
+dyld_shared_cache_*
+.DS_Store

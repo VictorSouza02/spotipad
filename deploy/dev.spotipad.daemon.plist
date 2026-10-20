@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.spotipad.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/var/root/spotipad/spotipad</string>
+    <string>/var/root/spotipad</string>
+    <string>8888</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/var/root/spotipad/log.txt</string>
+  <key>StandardErrorPath</key><string>/var/root/spotipad/log.txt</string>
+  <key>JetsamProperties</key>
+  <dict>
+    <key>JetsamPriority</key><integer>12</integer>
+    <key>JetsamMemoryLimit</key><integer>200</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SP_PLATFORM</key><string>17</string>
+  </dict>
+</dict>
+</plist>
