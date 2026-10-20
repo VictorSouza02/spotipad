@@ -19,7 +19,7 @@ iOS 9 SSH only speaks old algorithms (`ssh-rsa`, `diffie-hellman-group14-sha1`);
 
 | Variable | Default | Use |
 |---|---|---|
-| `IPAD_PASS` | — (required) | iPad root password. Never commit it |
+| `IPAD_PASS` | `~/.config/spotipad/ipad_pass` | iPad root password (env or that file, chmod 600). Never commit it |
 | `IPAD_HOST` | — (required) | iPad IP address on the network |
 | `IPAD_JUMP` | empty | ProxyJump, e.g. `user@host-on-that-network`, when the computer is not on the iPad's network |
 | `CARGO_TARGET_DIR` | `./target` | build directory |

@@ -6,6 +6,7 @@ edition = "2021"
 crate-type = ["staticlib"]
 [dependencies]
 librespot-core = { path = "../core", version = "0.6.0" }
+librespot-audio = { path = "../audio", version = "0.6.0" }
 librespot-protocol = { path = "../protocol", version = "0.6.0" }
 protobuf = "3.5"
 data-encoding = "2"

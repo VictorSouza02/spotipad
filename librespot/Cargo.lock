@@ -1337,6 +1337,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "http",
+ "librespot-audio",
  "librespot-core",
  "librespot-playback",
  "librespot-protocol",

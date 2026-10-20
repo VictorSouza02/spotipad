@@ -33,7 +33,7 @@ HTTP/1.1, `Connection: close`, UTF-8 JSON. Errors: 4xx/5xx status with `{"error"
 | `POST /api/seek?ms=<n>` | position |
 | `POST /api/jump?i=<n>` | play queue item n |
 | `GET /api/queue` | `{"idx", "tracks": [Item]}` |
-| `GET /api/status` | `{"playing","loading","idx","count","item","pos_ms","error","ctx","connected"}` |
+| `GET /api/status` | `{"playing","loading","idx","count","item","pos_ms","error","ctx","connected","underruns","buffered_ms"}` |
 
 Every playback route answers with the same JSON as `/api/status`.
 

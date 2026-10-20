@@ -30,6 +30,7 @@ use librespot_core::{
     session::Session,
     spotify_id::{SpotifyId, SpotifyItemType},
 };
+use librespot_audio::AudioFetchParams;
 use librespot_playback::audio_backend::{Sink, SinkAsBytes, SinkError, SinkResult};
 use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::convert::Converter;
@@ -53,6 +54,7 @@ const META_PARALLEL: usize = 4;
 const PLAYLIST_PARALLEL: usize = 3;
 const ROOT_TTL: Duration = Duration::from_secs(30);
 const LIKED_TTL: Duration = Duration::from_secs(30);
+const AUDIO_CACHE_BYTES: u64 = 2 << 30;
 const WARMUP_EVERY: Duration = Duration::from_secs(15 * 60);
 
 // ---------------------------------------------------------------- audio sink (AudioQueue)
@@ -62,6 +64,9 @@ extern "C" {
     fn aq_pause(h: *mut c_void);
     fn aq_resume(h: *mut c_void);
     fn aq_flush(h: *mut c_void);
+    fn aq_underruns() -> u32;
+    fn aq_buffered_ms() -> u32;
+    fn aq_boost_thread();
 }
 
 static AQ: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -73,12 +78,17 @@ fn audio_flush() {
     }
 }
 
-struct AqSink;
+// Reused PCM scratch buffer: no allocation per packet on the decode thread.
+struct AqSink {
+    pcm: Vec<i16>,
+}
 
 impl Sink for AqSink {
     fn start(&mut self) -> SinkResult<()> {
         let p = AQ.load(Ordering::Acquire);
         if p.is_null() {
+            // First start runs on librespot's player thread: give it realtime priority.
+            unsafe { aq_boost_thread() };
             let p = unsafe { aq_new(44100, 2) };
             if p.is_null() {
                 return Err(SinkError::NotConnected("aq_new failed".into()));
@@ -96,12 +106,15 @@ impl Sink for AqSink {
         }
         Ok(())
     }
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+    fn write(&mut self, packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
         if let AudioPacket::Samples(samples) = packet {
-            let b = converter.f64_to_s16(&samples);
+            // Plain f32 scale + saturating cast; TPDF dither costs two RNG draws per sample
+            // in f64 on the A5 and is inaudible at 16-bit for lossy sources.
+            self.pcm.clear();
+            self.pcm.extend(samples.iter().map(|&s| (s as f32 * 32767.0) as i16));
             let p = AQ.load(Ordering::Acquire);
             if !p.is_null() {
-                unsafe { aq_write(p, b.as_ptr() as *const u8, (b.len() * 2) as c_int) };
+                unsafe { aq_write(p, self.pcm.as_ptr() as *const u8, (self.pcm.len() * 2) as c_int) };
             }
         }
         Ok(())
@@ -891,6 +904,8 @@ impl App {
             "error": q.error,
             "ctx": q.ctx,
             "connected": !self.session().is_invalid(),
+            "underruns": unsafe { aq_underruns() },
+            "buffered_ms": unsafe { aq_buffered_ms() },
         })
         .to_string()
     }
@@ -1277,7 +1292,15 @@ pub extern "C" fn spotipad_main(dir: *const c_char, port: c_int) -> c_int {
         Err(_) => return -10,
     };
     rt.block_on(async move {
-        let cache = match Cache::new(Some(&dir), None, None, None) {
+        // Read far ahead so CDN stalls never reach the decoder (a 160 kbps track is ~5 MB).
+        let _ = AudioFetchParams::set(AudioFetchParams {
+            read_ahead_during_playback: Duration::from_secs(30),
+            minimum_download_size: 256 * 1024,
+            ..AudioFetchParams::default()
+        });
+        // Audio cache on disk: replays and skips back read local files, no network.
+        let audio_dir = dir.join("audio");
+        let cache = match Cache::new(Some(&dir), None, Some(&audio_dir), Some(AUDIO_CACHE_BYTES)) {
             Ok(c) => c,
             Err(e) => {
                 error!("cache: {}", e);
@@ -1295,8 +1318,14 @@ pub extern "C" fn spotipad_main(dir: *const c_char, port: c_int) -> c_int {
         };
         let cfg = SessionConfig::default();
         let session = Session::new(cfg.clone(), Some(cache.clone()));
-        let pcfg = PlayerConfig { bitrate: Bitrate::Bitrate160, ..PlayerConfig::default() };
-        let player = Player::new(pcfg, session.clone(), Box::new(NoOpVolume), || Box::new(AqSink));
+        let pcfg = PlayerConfig {
+            bitrate: Bitrate::Bitrate160,
+            ditherer: None,
+            ..PlayerConfig::default()
+        };
+        let player = Player::new(pcfg, session.clone(), Box::new(NoOpVolume), || {
+            Box::new(AqSink { pcm: Vec::with_capacity(4096) })
+        });
         let app = Arc::new(App {
             dir: dir.clone(),
             session: Mutex::new(session.clone()),

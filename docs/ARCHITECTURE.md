@@ -67,10 +67,18 @@ Liked Songs → missing metadata → drop playlists that left the library → do
 Threads must not exit on this target (see KNOWLEDGE.md, TLS pitfall).
 
 ### `native/aq.c` (audio)
-AudioQueue PCM at 44.1 kHz stereo s16, 6 buffers of 16 KB (~93 ms each).
-Every buffer has a state `FREE → FILLING → QUEUED`. Enqueue happens under the lock, and `aq_flush` calls
-`AudioQueueReset` and reclaims the `QUEUED` buffers itself, because iOS 9 does not call the output callback
-for buffers discarded by a reset. `aq_pause`/`aq_resume` use `AudioQueuePause`/`Start`.
+AudioQueue PCM at 44.1 kHz stereo s16, pull model. The decoder thread writes into a 512 KB ring
+(~3 s) and blocks while it is full; the output callback refills each of 4 AudioQueue buffers of 8 KB
+(~46 ms) to full capacity from the ring, so a decoder or network hiccup shorter than the ring is inaudible.
+Playback starts with 0.5 s buffered; after a flush (skip/seek) feeding waits for 0.25 s so the new track
+does not start with a gap. Buffers are `IDLE` (ours) or `QUEUED` (the queue's). `aq_flush` empties the
+ring, calls `AudioQueueReset` and reclaims every buffer itself, because iOS 9 does not call the output
+callback for buffers discarded by a reset. `aq_pause`/`aq_resume` use `AudioQueuePause`/`Start`.
+`aq_underruns` counts mid-stream moments the queue ran dry (exposed in `/api/status`).
+
+Decode path tuning for the A5: the player thread runs at `SCHED_RR` priority 45 (`aq_boost_thread`),
+the sink converts f64 to s16 without dither into a reused buffer, audio fetch reads 30 s ahead in 256 KB
+requests, and decrypted audio files are cached on disk in `<data dir>/audio` (2 GB cap).
 
 ### `index.html` (UI)
 - Plain ES5, `-webkit-` prefixes, no libraries: the target is iOS 9 Safari on an A5.
