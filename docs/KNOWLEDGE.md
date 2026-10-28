@@ -89,8 +89,8 @@ each problem. Behaviour observed in October 2026; Spotify changes endpoints with
   discarded buffers back through the callback, and the writer blocks forever. `aq.c` tracks every buffer's state
   and reclaims them itself.
 - **iOS 9 Safari**: ES5 only, no `fetch` (use `XMLHttpRequest`), `-webkit-` prefixes for flex, transforms and
-  animations. `width=device-width` removes the 300 ms click delay. Some CDNs' modern TLS fails, so covers are
-  proxied by the daemon.
+  animations. `width=device-width` removes the 300 ms click delay. Some CDNs' modern TLS fails, so external
+  resources must be proxied by the daemon.
 - **Web clip**: a `*.webclip` folder in `/var/mobile/Library/WebClips/` with an `Info.plist`
   (`URL`, `Title`, `FullScreen`, `IconIsPrecomposed`...) and `icon.png`, owned by `mobile`. SpringBoard must be restarted.
 - **Missing tools on the iPad**: no `curl`, `python3`, `awk`, `netstat`, `strings`. There is `openssl`, `ldid`,
@@ -117,7 +117,8 @@ each problem. Behaviour observed in October 2026; Spotify changes endpoints with
 | `aq_flush` on manual changes | the new track starts without ~0.5 s of the old one |
 | HTTP up before login | UI opens during boot with the cache |
 | Virtualized list in the UI | 22–37 DOM nodes for 407 tracks |
-| 64 px covers cached on disk | ~3 KB each, served locally |
+| No cover art (UI shows none) | cache.json 387 → 298 KB, no image requests |
+| Queue in `state.json`, searches in `cache.json` | restart resumes the track at its position; repeated search 1.7 s → 10 ms after a restart |
 
 CPU while playing: 10–15 % (~65 % peak while loading a track). Memory: ~13 MB.
 

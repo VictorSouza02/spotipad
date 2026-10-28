@@ -11,7 +11,9 @@
 // - Track metadata is fetched only for unknown URIs, in parallel batches.
 // - Warmup at startup (and every 15 min) prefetches the rootlist, every playlist, liked songs
 //   and all their metadata.
-// - Cover art is proxied and cached on disk; the UI uses 64px images.
+// - The playback queue (context, tracks, position) is persisted to state.json, so a daemon
+//   restart or reboot resumes where it stopped. Searches are cached in cache.json too.
+// - No cover art: the UI shows none, so nothing is fetched, listed or stored for it.
 // - Track changes flush the AudioQueue so skips are instant.
 use std::collections::{HashMap, HashSet};
 use std::os::raw::{c_char, c_int, c_void};
@@ -56,6 +58,10 @@ const ROOT_TTL: Duration = Duration::from_secs(30);
 const LIKED_TTL: Duration = Duration::from_secs(30);
 const AUDIO_CACHE_BYTES: u64 = 2 << 30;
 const WARMUP_EVERY: Duration = Duration::from_secs(15 * 60);
+// A dropped AP connection can stall connect() forever; without a cap the housekeeping loop
+// (reconnect, saves, warmup) stopped for days.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const SEARCH_CACHE_MAX: usize = 200;
 
 // ---------------------------------------------------------------- audio sink (AudioQueue)
 extern "C" {
@@ -136,8 +142,6 @@ struct Item {
     #[serde(default)]
     artist: String,
     #[serde(default)]
-    img: String,
-    #[serde(default)]
     dur: u32,
 }
 
@@ -165,6 +169,21 @@ struct Store {
     root: Option<RootCache>,
     #[serde(default)]
     liked: Option<Vec<String>>,
+    #[serde(default)]
+    searches: HashMap<String, Vec<String>>, // normalized query -> track URIs
+}
+
+/// Playback queue persisted to <dir>/state.json (tracks by URI; names come from the meta cache).
+#[derive(Serialize, Deserialize, Default)]
+struct SavedQueue {
+    #[serde(default)]
+    ctx: String,
+    #[serde(default)]
+    uris: Vec<String>,
+    #[serde(default)]
+    idx: usize,
+    #[serde(default)]
+    pos_ms: u32,
 }
 
 #[derive(Default)]
@@ -178,6 +197,7 @@ struct Queue {
     req_id: u64,
     error: String,
     ctx: String,
+    restored: bool, // loaded from state.json, nothing loaded in the player yet
 }
 
 struct App {
@@ -192,36 +212,11 @@ struct App {
     root_at: Mutex<Option<Instant>>,
     liked_at: Mutex<Option<Instant>>,
     inflight: Mutex<HashSet<String>>,
-    searches: Mutex<HashMap<String, Vec<String>>>,
+    saved_q: Mutex<String>, // last state.json written, to skip identical writes
 }
 
 fn hex(b: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(b)
-}
-
-/// 64px cover from an ImageGroup (iPad mini 1 is non-retina; rows are 48px), proxied by /img.
-fn cover(g: Option<&pm::ImageGroup>) -> String {
-    let Some(g) = g else { return String::new() };
-    let pick = g
-        .image
-        .iter()
-        .find(|i| i.size() == pm::image::Size::SMALL)
-        .or_else(|| g.image.iter().find(|i| i.size() == pm::image::Size::DEFAULT))
-        .or_else(|| g.image.first());
-    pick.map(|i| format!("/img/{}", hex(i.file_id()))).unwrap_or_default()
-}
-
-fn collect_imgs(v: &Value, out: &mut HashSet<String>) {
-    if let Some(items) = v["items"].as_array() {
-        for it in items {
-            if let Some(i) = it["img"].as_str() {
-                if !i.is_empty() {
-                    out.insert(i.to_string());
-                }
-            }
-            collect_imgs(it, out);
-        }
-    }
 }
 
 fn track_id(uri: &str) -> Option<SpotifyId> {
@@ -277,10 +272,6 @@ fn parse_rootlist(c: &pl::SelectedListContent, user: &str) -> RootCache {
                 .map(|a| a.name().to_string())
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "Playlist".into());
-            let img = attrs
-                .filter(|a| a.has_picture())
-                .map(|a| format!("/img/{}", hex(a.picture())))
-                .unwrap_or_default();
             let owner = meta.map(|m| m.owner_username().to_string()).unwrap_or_default();
             let len = meta.map(|m| m.length()).unwrap_or(0);
             let sub = if owner.is_empty() || owner == user {
@@ -297,7 +288,7 @@ fn parse_rootlist(c: &pl::SelectedListContent, user: &str) -> RootCache {
                 .last_mut()
                 .unwrap()
                 .2
-                .push(json!({ "t": "p", "id": id, "name": name, "img": img, "sub": sub }));
+                .push(json!({ "t": "p", "id": id, "name": name, "sub": sub }));
         }
     }
     while stack.len() > 1 {
@@ -340,6 +331,69 @@ impl App {
         info!("cache saved: {} KB in {} ms", bytes.len() / 1024, ms(t));
     }
 
+    // ------------------------------------------------ queue persistence
+    fn restore_queue(&self) {
+        let Some(sq) = std::fs::read(self.dir.join("state.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SavedQueue>(&b).ok())
+        else {
+            return;
+        };
+        let items = self.items_for(&sq.uris);
+        if items.is_empty() {
+            return;
+        }
+        let mut q = self.q.lock().unwrap();
+        q.idx = sq.idx.min(items.len() - 1);
+        q.items = items;
+        q.ctx = sq.ctx;
+        q.pos_ms = sq.pos_ms;
+        q.restored = true;
+        info!("queue restored: {} tracks, #{} at {} s", q.items.len(), q.idx, q.pos_ms / 1000);
+    }
+
+    fn save_queue(&self) {
+        let body = {
+            let q = self.q.lock().unwrap();
+            if q.items.is_empty() {
+                return;
+            }
+            let pos = q.pos_ms + q.pos_at.map_or(0, |t| t.elapsed().as_millis() as u32);
+            let sq = SavedQueue {
+                ctx: q.ctx.clone(),
+                uris: q.items.iter().map(|i| i.uri.clone()).collect(),
+                idx: q.idx,
+                pos_ms: pos / 1000 * 1000, // whole seconds: a paused queue writes once
+            };
+            serde_json::to_string(&sq).unwrap_or_default()
+        };
+        let mut last = self.saved_q.lock().unwrap();
+        if body.is_empty() || *last == body {
+            return;
+        }
+        let tmp = self.dir.join("state.json.tmp");
+        if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, self.dir.join("state.json")).is_ok() {
+            *last = body;
+        }
+    }
+
+    /// Resume after a restart: the player has nothing loaded, so load the saved track at its position.
+    fn resume_restored(&self) -> bool {
+        let mut q = self.q.lock().unwrap();
+        if !q.restored {
+            return false;
+        }
+        q.restored = false;
+        let Some(id) = q.items.get(q.idx).and_then(|i| track_id(&i.uri)) else { return false };
+        let pos = q.pos_ms;
+        q.loading = true;
+        q.pos_at = None;
+        drop(q);
+        audio_flush();
+        self.player.load(id, true, pos);
+        true
+    }
+
     // ------------------------------------------------ playback
     fn load_current(&self, start: bool) {
         let mut q = self.q.lock().unwrap();
@@ -350,6 +404,7 @@ impl App {
                 q.pos_ms = 0;
                 q.pos_at = None;
                 q.error.clear();
+                q.restored = false;
                 drop(q);
                 audio_flush();
                 self.player.load(id, start, 0);
@@ -379,7 +434,10 @@ impl App {
         warn!("session invalid, reconnecting");
         let creds = self.cache.credentials().ok_or("no saved credentials")?;
         let s = Session::new(self.cfg.clone(), Some(self.cache.clone()));
-        s.connect(creds, true).await.map_err(|e| e.to_string())?;
+        tokio::time::timeout(CONNECT_TIMEOUT, s.connect(creds, true))
+            .await
+            .map_err(|_| "connect timed out".to_string())?
+            .map_err(|e| e.to_string())?;
         self.player.set_session(s.clone());
         *self.session.lock().unwrap() = s;
         info!("reconnected");
@@ -485,7 +543,6 @@ impl App {
                                     uri,
                                     name: t.name().to_string(),
                                     artist: t.artist.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "),
-                                    img: cover(t.album.cover_group.as_ref()),
                                     dur: t.duration().max(0) as u32,
                                 },
                             );
@@ -724,7 +781,7 @@ impl App {
     /// Track search via context-resolve (`spotify:search:<words+joined>`); searchview is gone.
     async fn search_uris(&self, q: &str) -> Result<Vec<String>, String> {
         let key = q.trim().to_lowercase();
-        if let Some(u) = self.searches.lock().unwrap().get(&key).cloned() {
+        if let Some(u) = self.store.lock().unwrap().searches.get(&key).cloned() {
             return Ok(u);
         }
         let words: Vec<String> = key
@@ -752,11 +809,14 @@ impl App {
         }
         uris.truncate(50);
         info!("search '{}': {} in {} ms", key, uris.len(), ms(t));
-        let mut s = self.searches.lock().unwrap();
-        if s.len() > 200 {
-            s.clear();
+        {
+            let mut st = self.store.lock().unwrap();
+            if st.searches.len() >= SEARCH_CACHE_MAX {
+                st.searches.clear();
+            }
+            st.searches.insert(key, uris.clone());
         }
-        s.insert(key, uris.clone());
+        self.mark_dirty();
         Ok(uris)
     }
 
@@ -781,53 +841,6 @@ impl App {
         };
         self.ensure_meta(&uris).await?;
         Ok(self.items_for(&uris))
-    }
-
-    // ------------------------------------------------ images (disk cached)
-    async fn image(&self, hexid: &str) -> Result<Bytes, String> {
-        if hexid.len() < 20 || hexid.len() > 64 || !hexid.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err("bad id".into());
-        }
-        let path = self.dir.join("img").join(hexid);
-        if let Ok(b) = std::fs::read(&path) {
-            return Ok(Bytes::from(b));
-        }
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(format!("https://i.scdn.co/image/{}", hexid))
-            .body(Bytes::new())
-            .map_err(|e| e.to_string())?;
-        let b = self.session().http_client().request_body(req).await.map_err(|e| e.to_string())?;
-        let _ = std::fs::write(&path, &b);
-        Ok(b)
-    }
-
-    /// Download every cover the UI can show (64px, ~3 KB each) so lists paint fully at once.
-    async fn prefetch_images(&self) {
-        let t = Instant::now();
-        let ids: Vec<String> = {
-            let st = self.store.lock().unwrap();
-            let mut set: HashSet<String> = st.meta.values().map(|i| i.img.clone()).collect();
-            if let Some(r) = &st.root {
-                collect_imgs(&r.tree, &mut set);
-            }
-            set.into_iter()
-                .filter_map(|p| p.strip_prefix("/img/").map(|s| s.to_string()))
-                .filter(|h| !self.dir.join("img").join(h).exists())
-                .collect()
-        };
-        if ids.is_empty() {
-            return;
-        }
-        let n = ids.len();
-        let ok: usize = stream::iter(ids)
-            .map(|h| async move { self.image(&h).await.is_ok() as usize })
-            .buffer_unordered(6)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .sum();
-        info!("images: {}/{} prefetched in {} ms", ok, n, ms(t));
     }
 
     // ------------------------------------------------ warmup
@@ -875,7 +888,6 @@ impl App {
         }
         self.mark_dirty();
         self.save_store();
-        self.prefetch_images().await;
         let tracks = self.store.lock().unwrap().meta.len();
         info!(
             "warmup done: {} playlists ({} refreshed), {} tracks cached, {} ms",
@@ -992,11 +1004,12 @@ async fn housekeeping(app: Arc<App>) {
     let mut last_warm = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
+        app.save_queue();
+        app.save_store();
         if let Err(e) = app.ensure_session().await {
             error!("reconnect failed: {}", e);
             continue;
         }
-        app.save_store();
         if last_warm.elapsed() > WARMUP_EVERY {
             last_warm = Instant::now();
             app.warmup().await;
@@ -1112,13 +1125,6 @@ fn shuffle<T>(v: &mut [T]) {
 async fn handle(app: Arc<App>, mut sock: TcpStream) {
     let _ = sock.set_nodelay(true);
     let Some(r) = read_req(&mut sock).await else { return };
-    if let Some(hexid) = r.path.strip_prefix("/img/") {
-        match app.image(hexid).await {
-            Ok(b) => send(&mut sock, 200, "image/jpeg", "public, max-age=31536000, immutable", &b).await,
-            Err(e) => respond(&mut sock, 404, jerr(&e).as_bytes()).await,
-        }
-        return;
-    }
     let q = |k: &str| r.query.get(k).cloned().unwrap_or_default();
     let t = Instant::now();
     let api: Option<Result<Value, String>> = match r.path.as_str() {
@@ -1206,7 +1212,9 @@ async fn handle(app: Arc<App>, mut sock: TcpStream) {
             let empty = app.q.lock().unwrap().items.is_empty();
             if !empty {
                 let _ = app.ensure_session().await;
-                app.player.play();
+                if !app.resume_restored() {
+                    app.player.play();
+                }
             }
             respond(&mut sock, 200, app.status_json().as_bytes()).await
         }
@@ -1278,7 +1286,8 @@ pub extern "C" fn spotipad_main(dir: *const c_char, port: c_int) -> c_int {
         .format_timestamp_secs()
         .try_init();
     let dir = PathBuf::from(cstr(dir));
-    let _ = std::fs::create_dir_all(dir.join("img"));
+    // Covers are not used any more: drop the old cover cache (~4.5 MB) once.
+    let _ = std::fs::remove_dir_all(dir.join("img"));
     let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1338,8 +1347,10 @@ pub extern "C" fn spotipad_main(dir: *const c_char, port: c_int) -> c_int {
             root_at: Mutex::new(None),
             liked_at: Mutex::new(None),
             inflight: Mutex::new(HashSet::new()),
-            searches: Mutex::new(HashMap::new()),
+            saved_q: Mutex::new(String::new()),
         });
+        app.restore_queue();
+        app.mark_dirty(); // rewrite cache.json once in the current format
         {
             let app = app.clone();
             tokio::spawn(async move {
@@ -1358,7 +1369,10 @@ pub extern "C" fn spotipad_main(dir: *const c_char, port: c_int) -> c_int {
                 error!("no credentials.json in {}", dir.display());
                 return -12;
             };
-            match session.connect(creds, true).await {
+            match tokio::time::timeout(CONNECT_TIMEOUT, session.connect(creds, true))
+                .await
+                .unwrap_or_else(|_| Err(librespot_core::Error::deadline_exceeded("connect timed out")))
+            {
                 Ok(()) => break,
                 Err(e) => {
                     error!("connect failed: {} (retry in {}s)", e, wait);

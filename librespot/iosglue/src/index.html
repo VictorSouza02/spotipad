@@ -108,8 +108,18 @@ html, body { margin: 0; background: #000; color: #33ff66;
   var CH = 9; // monospace char width in px, measured below
   function cols(px) { return Math.max(10, Math.floor(px / CH)); }
   var mem = {};
-  function lsGet(k) { try { var v = localStorage.getItem('sf:' + k); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
-  function lsSet(k, v) { try { localStorage.setItem('sf:' + k, JSON.stringify(v)); } catch (e) { try { localStorage.clear(); } catch (e2) {} } }
+  // Old format kept text + parsed copy under 'sf:/api/...': drop it once.
+  try { for (var li = localStorage.length - 1; li >= 0; li--) { var lk = localStorage.key(li); if (lk && lk.indexOf('sf:/api/') === 0) localStorage.removeItem(lk); } } catch (e) {}
+  function lsGetRaw(k) { try { return localStorage.getItem('sf:r:' + k); } catch (e) { return null; } }
+  // On a quota error drop the cached API bodies (all refetchable), then retry once.
+  function lsSetRaw(k, t) {
+    try { localStorage.setItem('sf:r:' + k, t); } catch (e) {
+      try {
+        for (var i = localStorage.length - 1; i >= 0; i--) { var n = localStorage.key(i); if (n && n.indexOf('sf:r:') === 0) localStorage.removeItem(n); }
+        localStorage.setItem('sf:r:' + k, t);
+      } catch (e2) {}
+    }
+  }
   function xhr(method, url, body, cb) {
     var x = new XMLHttpRequest();
     x.open(method, url, true);
@@ -122,14 +132,16 @@ html, body { margin: 0; background: #000; color: #33ff66;
     x.send(body ? JSON.stringify(body) : null);
   }
   // cached GET: memory -> localStorage -> network; calls cb again only if data changed.
+  // localStorage keeps only the raw text (half the size of text + parsed copy), parsed on first use.
   function cget(url, persist, cb, onErr) {
-    var c = mem[url] || (persist ? lsGet(url) : null), shown = null;
-    if (c) { mem[url] = c; shown = c.t; cb(c.j, true); }
+    var c = mem[url], shown = null;
+    if (!c && persist) { var t = lsGetRaw(url); if (t) { try { c = mem[url] = { t: t, j: JSON.parse(t) }; } catch (e) {} } }
+    if (c) { shown = c.t; cb(c.j, true); }
     xhr('GET', url, null, function (err, j, text) {
       if (err) { if (!c && onErr) onErr(err); return; }
       if (text === shown) return;
       mem[url] = { t: text, j: j };
-      if (persist) lsSet(url, mem[url]);
+      if (persist) lsSetRaw(url, text);
       cb(j, false);
     });
   }

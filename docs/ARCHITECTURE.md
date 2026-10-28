@@ -12,7 +12,7 @@ on top of librespot. On the iPad the frontend is a web UI served by the daemon i
  │   http://127.0.0.1:8888  ── ASCII UI (index.html, ES5)       │
  │            │ XHR JSON                                         │
  │ launchd ── spotipad (root daemon, KeepAlive)                │
- │   ├─ HTTP server (tokio)            /  /api/*  /img/*        │
+ │   ├─ HTTP server (tokio)            /  /api/*                │
  │   ├─ App: cache (cache.json), queue, warmup, SWR             │
  │   ├─ librespot Session  ── AP (ap-*.spotify.com:4070)        │
  │   │                      ── spclient (HTTPS, login5 token)   │
@@ -39,11 +39,15 @@ band (12). Then it calls `spotipad_main(dir, port)` in Rust.
 4. Starts the warmup and the player event loop.
 
 **Cache (`Store`, persisted to `cache.json`)**
-- `meta`: track URI → `{name, artist, img, dur}`.
+- `meta`: track URI → `{name, artist, dur}`. No cover art: the UI shows none, so nothing is fetched or stored.
 - `lists`: `playlist:<id>` and `album:<id>` → `{rev, name, uris}`.
 - `root`: library tree (folders + playlists) and each playlist's revision.
 - `liked`: Liked Songs URIs, newest first.
+- `searches`: normalized query → track URIs (up to 200 queries, survives restarts).
 - Saved every 15 s when dirty (write to `.tmp` + `rename`).
+
+**Queue (`state.json`)**: context, track URIs, index and position (whole seconds), written every 15 s when
+changed. At startup it is restored paused; the first `/api/resume` loads the track at the saved position.
 
 **Freshness**
 - Playlists: the rootlist carries every playlist's revision. If the cached revision matches, the playlist is
@@ -53,7 +57,7 @@ band (12). Then it calls `spotipad_main(dir, port)` in Rust.
 - Background jobs are de-duplicated by key (`inflight`).
 
 **Warmup** (at boot and every 15 min): rootlist → playlists whose revision changed (3 in parallel) →
-Liked Songs → missing metadata → drop playlists that left the library → download 64 px covers.
+Liked Songs → missing metadata → drop playlists that left the library.
 
 **Queue and playback**
 - `POST /api/play {ctx, uri, shuffle}`: the server resolves the context (`liked`, `playlist:<id>`,
@@ -62,6 +66,7 @@ Liked Songs → missing metadata → drop playlists that left the library → do
 - Natural end of track: the next track loads without discarding buffered audio (no gap).
 - Manual skip/seek/change: `aq_flush` drops queued audio immediately.
 - Reconnect: every 15 s the session is checked; if it dropped, a new one is created and `player.set_session` is called.
+  `connect()` is capped at 20 s: without the cap a dropped AP connection once stalled the loop (and its saves) for days.
 
 **tokio runtime**: 2 workers, up to 8 blocking threads, `thread_keep_alive` of one year.
 Threads must not exit on this target (see KNOWLEDGE.md, TLS pitfall).
@@ -84,7 +89,7 @@ requests, and decrypted audio files are cached on disk in `<data dir>/audio` (2 
 - Plain ES5, `-webkit-` prefixes, no libraries: the target is iOS 9 Safari on an A5.
 - Virtualized list: 52 px rows placed with `translate3d`, a pool of reused nodes.
   A 407-track playlist keeps 22–37 nodes in the DOM.
-- Client cache: memory → `localStorage` → network; redraws only if the JSON changed.
+- Client cache: memory → `localStorage` (raw JSON text only) → network; redraws only if the JSON changed.
 - Touch handling tells taps from scrolls (8 px threshold) and gives inverse-video feedback.
 - Player bar: scrolling marquee, `[#####>-----]` progress interpolated locally,
   status polled every 1.5 s (3 s while playing).
@@ -101,7 +106,6 @@ All with the **login5** token (not the public Web API). See KNOWLEDGE.md for why
 | Liked Songs | `POST /collection/v2/paging` (protobuf `collection2v2.PageRequest`) |
 | Metadata | `POST /extended-metadata/v0/extended-metadata` (`TRACK_V4`, `ALBUM_V4`) |
 | Search | `GET /context-resolve/v1/spotify:search:<words+joined>` without the metrics parameters |
-| Covers | `https://i.scdn.co/image/<hex>` (proxied and disk-cached by the daemon) |
 
 ## Files on the iPad
 
@@ -110,7 +114,8 @@ All with the **login5** token (not the public Web API). See KNOWLEDGE.md for why
 | `/var/root/spotipad/spotipad` | binary (signed with `ldid -S` on the iPad) |
 | `/var/root/spotipad/credentials.json` | reusable credentials (secret) |
 | `/var/root/spotipad/cache.json` | library cache |
-| `/var/root/spotipad/img/` | 64 px covers |
+| `/var/root/spotipad/state.json` | playback queue and position |
+| `/var/root/spotipad/audio/` | decrypted audio cache (2 GB cap) |
 | `/var/root/spotipad/log.txt` | log (stdout+stderr) |
 | `/Library/LaunchDaemons/dev.spotipad.daemon.plist` | daemon (RunAtLoad, KeepAlive, `SP_PLATFORM=17`) |
 | `/var/mobile/Library/WebClips/5B0F...FA57.webclip/` | home-screen icon → `http://127.0.0.1:8888/` |

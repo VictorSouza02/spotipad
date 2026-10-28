@@ -7,19 +7,18 @@ HTTP/1.1, `Connection: close`, UTF-8 JSON. Errors: 4xx/5xx status with `{"error"
 
 ```json
 // Item (track)
-{ "uri": "spotify:track:...", "name": "...", "artist": "A, B", "img": "/img/<hex>", "dur": 213560 }
+{ "uri": "spotify:track:...", "name": "...", "artist": "A, B", "dur": 213560 }
 ```
 
 ## Library
 
 | Method and route | Response |
 |---|---|
-| `GET /api/playlists` | `{"items": [Node]}`. Node = `{"t":"p","id","name","img","sub"}` (playlist) or `{"t":"f","id","name","n","items":[Node]}` (folder) |
+| `GET /api/playlists` | `{"items": [Node]}`. Node = `{"t":"p","id","name","sub"}` (playlist) or `{"t":"f","id","name","n","items":[Node]}` (folder) |
 | `GET /api/playlist?id=<base62>` | `{"name", "tracks": [Item]}` |
 | `GET /api/liked` | `{"name": "Liked Songs", "tracks": [Item]}` |
 | `GET /api/album?id=<base62>` | `{"name", "tracks": [Item]}` |
 | `GET /api/search?q=<text>` | `{"tracks": [Item]}` (up to 50; search returns tracks only) |
-| `GET /img/<hex>` | cover JPEG, `Cache-Control: immutable` |
 
 ## Playback
 
