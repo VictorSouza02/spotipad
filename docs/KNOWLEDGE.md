@@ -116,7 +116,7 @@ each problem. Behaviour observed in October 2026; Spotify changes endpoints with
 | Preload the next track as soon as the current one starts | skip 1.0 s → ~20 ms |
 | `aq_flush` on manual changes | the new track starts without ~0.5 s of the old one |
 | HTTP up before login | UI opens during boot with the cache |
-| Virtualized list in the UI | 22–37 DOM nodes for 407 tracks |
+| List rendering in the UI | iOS 9 web apps fire no scroll events during momentum scrolling, so a tight virtual window showed blank screens until the flick stopped. Lists up to 1500 rows are rendered whole (positioned with `top`, no layer per row); longer lists keep a 40-row overscan |
 | No cover art (UI shows none) | cache.json 387 → 298 KB, no image requests |
 | Queue in `state.json`, searches in `cache.json` | restart resumes the track at its position; repeated search 1.7 s → 10 ms after a restart |
 

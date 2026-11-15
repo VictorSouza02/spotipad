@@ -83,7 +83,7 @@ callback for buffers discarded by a reset. `aq_pause`/`aq_resume` use `AudioQueu
 
 Decode path tuning for the A5: the player thread runs at `SCHED_RR` priority 45 (`aq_boost_thread`),
 the sink converts f64 to s16 without dither into a reused buffer, audio fetch reads 30 s ahead in 256 KB
-requests, and decrypted audio files are cached on disk in `<data dir>/audio` (2 GB cap).
+requests, and decrypted audio files are cached on disk in `<data dir>/audio` (300 MB cap, oldest files pruned on start and on write).
 
 ### `index.html` (UI)
 - Plain ES5, `-webkit-` prefixes, no libraries: the target is iOS 9 Safari on an A5.
@@ -115,7 +115,7 @@ All with the **login5** token (not the public Web API). See KNOWLEDGE.md for why
 | `/var/root/spotipad/credentials.json` | reusable credentials (secret) |
 | `/var/root/spotipad/cache.json` | library cache |
 | `/var/root/spotipad/state.json` | playback queue and position |
-| `/var/root/spotipad/audio/` | decrypted audio cache (2 GB cap) |
+| `/var/root/spotipad/audio/` | decrypted audio cache (300 MB cap) |
 | `/var/root/spotipad/log.txt` | log (stdout+stderr) |
 | `/Library/LaunchDaemons/dev.spotipad.daemon.plist` | daemon (RunAtLoad, KeepAlive, `SP_PLATFORM=17`) |
 | `/var/mobile/Library/WebClips/5B0F...FA57.webclip/` | home-screen icon → `http://127.0.0.1:8888/` |

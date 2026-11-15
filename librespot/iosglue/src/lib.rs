@@ -56,7 +56,7 @@ const META_PARALLEL: usize = 4;
 const PLAYLIST_PARALLEL: usize = 3;
 const ROOT_TTL: Duration = Duration::from_secs(30);
 const LIKED_TTL: Duration = Duration::from_secs(30);
-const AUDIO_CACHE_BYTES: u64 = 2 << 30;
+const AUDIO_CACHE_BYTES: u64 = 300 << 20; // 300 MB, librespot prunes oldest files on start and on write
 const WARMUP_EVERY: Duration = Duration::from_secs(15 * 60);
 // A dropped AP connection can stall connect() forever; without a cap the housekeeping loop
 // (reconnect, saves, warmup) stopped for days.
@@ -184,6 +184,12 @@ struct SavedQueue {
     idx: usize,
     #[serde(default)]
     pos_ms: u32,
+    #[serde(default)]
+    shuffle: bool,
+    #[serde(default)]
+    repeat: bool,
+    #[serde(default)]
+    orig: Vec<String>, // unshuffled order, to restore when shuffle is turned off
 }
 
 #[derive(Default)]
@@ -198,6 +204,43 @@ struct Queue {
     error: String,
     ctx: String,
     restored: bool, // loaded from state.json, nothing loaded in the player yet
+    shuffle: bool,
+    repeat: bool,    // wrap to the first track at the end of the queue instead of stopping
+    orig: Vec<Item>, // unshuffled order while shuffle is on
+}
+
+impl Queue {
+    /// Index after the current one, wrapping around when repeat is on.
+    fn next_idx(&self) -> Option<usize> {
+        if self.idx + 1 < self.items.len() {
+            Some(self.idx + 1)
+        } else if self.repeat && !self.items.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Turn shuffle on or off without interrupting the current track: on keeps it first and
+    /// shuffles the rest; off restores the original order and points at the same track.
+    fn set_shuffle(&mut self, on: bool) {
+        if on == self.shuffle || self.items.is_empty() {
+            self.shuffle = on;
+            return;
+        }
+        if on {
+            self.orig = self.items.clone();
+            let cur = self.items.remove(self.idx.min(self.items.len() - 1));
+            shuffle(&mut self.items);
+            self.items.insert(0, cur);
+            self.idx = 0;
+        } else if !self.orig.is_empty() {
+            let uri = self.items.get(self.idx).map(|i| i.uri.clone()).unwrap_or_default();
+            self.items = std::mem::take(&mut self.orig);
+            self.idx = self.items.iter().position(|i| i.uri == uri).unwrap_or(0);
+        }
+        self.shuffle = on;
+    }
 }
 
 struct App {
@@ -348,6 +391,9 @@ impl App {
         q.items = items;
         q.ctx = sq.ctx;
         q.pos_ms = sq.pos_ms;
+        q.shuffle = sq.shuffle;
+        q.repeat = sq.repeat;
+        q.orig = if sq.shuffle { self.items_for(&sq.orig) } else { Vec::new() };
         q.restored = true;
         info!("queue restored: {} tracks, #{} at {} s", q.items.len(), q.idx, q.pos_ms / 1000);
     }
@@ -364,6 +410,9 @@ impl App {
                 uris: q.items.iter().map(|i| i.uri.clone()).collect(),
                 idx: q.idx,
                 pos_ms: pos / 1000 * 1000, // whole seconds: a paused queue writes once
+                shuffle: q.shuffle,
+                repeat: q.repeat,
+                orig: q.orig.iter().map(|i| i.uri.clone()).collect(),
             };
             serde_json::to_string(&sq).unwrap_or_default()
         };
@@ -416,7 +465,10 @@ impl App {
     fn skip(&self, delta: isize) -> bool {
         let mut q = self.q.lock().unwrap();
         let n = q.items.len() as isize;
-        let next = q.idx as isize + delta;
+        let mut next = q.idx as isize + delta;
+        if q.repeat && n > 0 && next >= n {
+            next = 0;
+        }
         if n == 0 || next < 0 || next >= n {
             q.playing = false;
             return false;
@@ -915,6 +967,8 @@ impl App {
             "pos_ms": pos,
             "error": q.error,
             "ctx": q.ctx,
+            "shuffle": q.shuffle,
+            "repeat": q.repeat,
             "connected": !self.session().is_invalid(),
             "underruns": unsafe { aq_underruns() },
             "buffered_ms": unsafe { aq_buffered_ms() },
@@ -941,7 +995,7 @@ async fn event_loop(app: Arc<App>) {
                     q.pos_at = Some(Instant::now());
                     // Preload the next track as soon as this one starts, so a manual skip hits
                     // an already-buffered file instead of a cold key/CDN/download round trip.
-                    if was_loading { q.items.get(q.idx + 1).and_then(|i| track_id(&i.uri)) } else { None }
+                    if was_loading { q.next_idx().and_then(|n| q.items.get(n)).and_then(|i| track_id(&i.uri)) } else { None }
                 };
                 if let Some(id) = next {
                     app.player.preload(id);
@@ -961,7 +1015,7 @@ async fn event_loop(app: Arc<App>) {
             }
             PlayerEvent::TimeToPreloadNextTrack { .. } => {
                 let q = app.q.lock().unwrap();
-                if let Some(it) = q.items.get(q.idx + 1) {
+                if let Some(it) = q.next_idx().and_then(|n| q.items.get(n)) {
                     if let Some(id) = track_id(&it.uri) {
                         app.player.preload(id);
                     }
@@ -972,8 +1026,8 @@ async fn event_loop(app: Arc<App>) {
                     // Natural end: no flush, the tail of the track is still queued (gapless).
                     let next = {
                         let mut q = app.q.lock().unwrap();
-                        if q.idx + 1 < q.items.len() {
-                            q.idx += 1;
+                        if let Some(n) = q.next_idx() {
+                            q.idx = n;
                             q.loading = true;
                             q.pos_ms = 0;
                             q.pos_at = None;
@@ -1107,8 +1161,9 @@ struct PlayBody {
     uri: String,
     #[serde(default)]
     index: usize,
+    /// true/false from the PLAY and SHUFFLE buttons; absent (a tapped track) keeps the current mode.
     #[serde(default)]
-    shuffle: bool,
+    shuffle: Option<bool>,
     #[serde(default)]
     items: Vec<Item>,
 }
@@ -1181,7 +1236,9 @@ async fn handle(app: Arc<App>, mut sock: TcpStream) {
             } else {
                 items.iter().position(|i| i.uri == b.uri).unwrap_or(0)
             };
-            if b.shuffle {
+            let shuf = b.shuffle.unwrap_or_else(|| app.q.lock().unwrap().shuffle);
+            let orig = if shuf { items.clone() } else { Vec::new() };
+            if shuf {
                 if b.uri.is_empty() {
                     shuffle(&mut items);
                 } else {
@@ -1196,6 +1253,8 @@ async fn handle(app: Arc<App>, mut sock: TcpStream) {
                 qq.items = items;
                 qq.idx = idx;
                 qq.ctx = b.ctx;
+                qq.shuffle = shuf;
+                qq.orig = orig;
             }
             if let Err(e) = app.ensure_session().await {
                 respond(&mut sock, 502, jerr(&e).as_bytes()).await;
@@ -1253,6 +1312,20 @@ async fn handle(app: Arc<App>, mut sock: TcpStream) {
             if ok {
                 app.load_current(true);
             }
+            respond(&mut sock, 200, app.status_json().as_bytes()).await
+        }
+        (_, "/api/shuffle") | (_, "/api/repeat") => {
+            let on = r.query.get("on").map(|v| v == "1");
+            {
+                let mut q = app.q.lock().unwrap();
+                if r.path == "/api/shuffle" {
+                    let v = on.unwrap_or(!q.shuffle);
+                    q.set_shuffle(v);
+                } else {
+                    q.repeat = on.unwrap_or(!q.repeat);
+                }
+            }
+            app.save_queue();
             respond(&mut sock, 200, app.status_json().as_bytes()).await
         }
         (_, "/api/queue") => {
